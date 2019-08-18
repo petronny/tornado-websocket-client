@@ -107,27 +107,30 @@ class WebSocket(object):
 
         self.key = base64.b64encode(os.urandom(16)).decode('utf-8')
         self.stream = iostream.IOStream(socket.socket())
-        self.stream.connect((self.host, self.port), self._on_connect)
 
-    def on_open(self):
+    async def start(self):
+        await self.stream.connect((self.host, self.port))
+        await self._on_connect()
+
+    async def on_open(self):
         pass
 
-    def on_message(self, data):
+    async def on_message(self, data):
         pass
 
-    def on_ping(self):
+    async def on_ping(self):
         pass
 
-    def on_pong(self):
+    async def on_pong(self):
         pass
 
-    def on_close(self):
+    async def on_close(self):
         pass
 
-    def on_unsupported(self):
+    async def on_unsupported(self):
         pass
 
-    def write_message(self, message, binary=False):
+    async def write_message(self, message, binary=False):
         """Sends the given message to the client of this Web Socket."""
         if binary:
             opcode = 0x2
@@ -135,16 +138,16 @@ class WebSocket(object):
             opcode = 0x1
         message = tornado.escape.utf8(message)
         assert isinstance(message, bytes_type)
-        self._write_frame(True, opcode, message)
+        await self._write_frame(True, opcode, message)
 
-    def ping(self):
-        self._write_frame(True, 0x9, b(''))
+    async def ping(self):
+        await self._write_frame(True, 0x9, b(''))
 
-    def close(self):
+    async def close(self):
         """Closes the WebSocket connection."""
         if not self.server_terminated:
             if not self.stream.closed():
-                self._write_frame(True, 0x8, b(""))
+                await self._write_frame(True, 0x8, b(""))
             self.server_terminated = True
         if self.client_terminated:
             if self._waiting is not None:
@@ -157,26 +160,27 @@ class WebSocket(object):
             self._waiting = self.stream.io_loop.add_timeout(
                 time.time() + 5, self._abort)
 
-    def _write_frame(self, fin, opcode, data):
-        self.stream.write(frame(data, opcode))
+    async def _write_frame(self, fin, opcode, data):
+        await self.stream.write(frame(data, opcode))
 
-    def _on_connect(self):
+    async def _on_connect(self):
         request = '\r\n'.join(INIT.splitlines()) % self.__dict__
         if self.headers is not None:
             request += '\r\n' + self.headers
         request += '\r\n\r\n'
-        self.stream.write(tornado.escape.utf8(request))
-        self.stream.read_until(b'\r\n\r\n', self._on_headers)
+        await self.stream.write(tornado.escape.utf8(request))
+        data = await self.stream.read_until(b'\r\n\r\n')
+        await self._on_headers(data)
 
-    def _on_headers(self, data):
+    async def _on_headers(self, data):
         first, _, rest = data.partition(b'\r\n')
         first = first.decode('utf-8')
         rest = rest.decode('utf-8')
         headers = HTTPHeaders.parse(rest)
         # Expect HTTP 101 response.
         if not re.match('HTTP/[^ ]+ 101', first):
-            self._async_callback(self.on_unsupported)()
-            self.close()
+            await self._async_callback(self.on_unsupported)()
+            await self.close()
         else:
             # Expect Connection: Upgrade.
             assert headers['Connection'].lower() == 'upgrade'
@@ -186,13 +190,14 @@ class WebSocket(object):
             accept = base64.b64encode(hashlib.sha1((self.key + MAGIC).encode('utf-8')).digest()).decode('utf-8')
             assert headers['Sec-WebSocket-Accept'] == accept
 
-            self._async_callback(self.on_open)()
-            self._receive_frame()
+            await self._async_callback(self.on_open)()
+            await self._receive_frame()
 
-    def _receive_frame(self):
-        self.stream.read_bytes(2, self._on_frame_start)
+    async def _receive_frame(self):
+        data = await self.stream.read_bytes(2)
+        await self._on_frame_start(data)
 
-    def _on_frame_start(self, data):
+    async def _on_frame_start(self, data):
         header, payloadlen = struct.unpack("BB", data)
         self._final_frame = header & 0x80
         reserved_bits = header & 0x70
@@ -200,31 +205,36 @@ class WebSocket(object):
         self._frame_opcode_is_control = self._frame_opcode & 0x8
         if reserved_bits:
             # client is using as-yet-undefined extensions; abort
-            return self._abort()
+            await self._abort()
         if (payloadlen & 0x80):
             # Masked frame -> abort connection
-            return self._abort()
+            await self._abort()
         payloadlen = payloadlen & 0x7f
         if self._frame_opcode_is_control and payloadlen >= 126:
             # control frames must have payload < 126
-            return self._abort()
+            await self._abort()
         if payloadlen < 126:
             self._frame_length = payloadlen
-            self.stream.read_bytes(self._frame_length, self._on_frame_data)
+            _data = await self.stream.read_bytes(self._frame_length)
+            await self._on_frame_data(_data)
         elif payloadlen == 126:
-            self.stream.read_bytes(2, self._on_frame_length_16)
+            _data = await self.stream.read_bytes(2)
+            await self._on_frame_length_16(_data)
         elif payloadlen == 127:
-            self.stream.read_bytes(8, self._on_frame_length_64)
+            _data = await self.stream.read_bytes(8)
+            await self._on_frame_length_64(_data)
 
-    def _on_frame_length_16(self, data):
+    async def _on_frame_length_16(self, data):
         self._frame_length = struct.unpack("!H", data)[0]
-        self.stream.read_bytes(self._frame_length, self._on_frame_data)
+        _data = await self.stream.read_bytes(self._frame_length)
+        await self._on_frame_data(_data)
 
-    def _on_frame_length_64(self, data):
+    async def _on_frame_length_64(self, data):
         self._frame_length = struct.unpack("!Q", data)[0]
-        self.stream.read_bytes(self._frame_length, self._on_frame_data)
+        _data = await self.stream.read_bytes(self._frame_length)
+        await self._on_frame_data(_data)
 
-    def _on_frame_data(self, data):
+    async def _on_frame_data(self, data):
         unmasked = array.array("B", data)
 
         if self._frame_opcode_is_control:
@@ -233,13 +243,13 @@ class WebSocket(object):
             # self._fragmented_*
             if not self._final_frame:
                 # control frames must not be fragmented
-                self._abort()
+                await self._abort()
                 return
             opcode = self._frame_opcode
         elif self._frame_opcode == 0:  # continuation frame
             if self._fragmented_message_buffer is None:
                 # nothing to continue
-                self._abort()
+                await self._abort()
                 return
             self._fragmented_message_buffer += unmasked
             if self._final_frame:
@@ -249,7 +259,7 @@ class WebSocket(object):
         else:  # start of new data message
             if self._fragmented_message_buffer is not None:
                 # can't start new message until the old one is finished
-                self._abort()
+                await self._abort()
                 return
             if self._final_frame:
                 opcode = self._frame_opcode
@@ -258,19 +268,19 @@ class WebSocket(object):
                 self._fragmented_message_buffer = unmasked
 
         if self._final_frame:
-            self._handle_message(opcode, unmasked.tostring())
+            await self._handle_message(opcode, unmasked.tobytes())
 
         if not self.client_terminated:
-            self._receive_frame()
+            await self._receive_frame()
 
-    def _abort(self):
+    async def _abort(self):
         """Instantly aborts the WebSocket connection by closing the socket"""
         self.client_terminated = True
         self.server_terminated = True
         self.stream.close()
-        self.close()
+        await self.close()
 
-    def _handle_message(self, opcode, data):
+    async def _handle_message(self, opcode, data):
         if self.client_terminated:
             return
 
@@ -279,25 +289,25 @@ class WebSocket(object):
             try:
                 decoded = data.decode("utf-8")
             except UnicodeDecodeError:
-                self._abort()
+                await self._abort()
                 return
-            self._async_callback(self.on_message)(decoded)
+            await self._async_callback(self.on_message)(decoded)
         elif opcode == 0x2:
             # Binary data
-            self._async_callback(self.on_message)(data)
+            await self._async_callback(self.on_message)(data)
         elif opcode == 0x8:
             # Close
             self.client_terminated = True
-            self.close()
+            await self.close()
         elif opcode == 0x9:
             # Ping
-            self._write_frame(True, 0xA, data)
-            self._async_callback(self.on_ping)()
+            await self._write_frame(True, 0xA, data)
+            await self._async_callback(self.on_ping)()
         elif opcode == 0xA:
             # Pong
-            self._async_callback(self.on_pong)()
+            await self._async_callback(self.on_pong)()
         else:
-            self._abort()
+            await self._abort()
 
     def _async_callback(self, callback, *args, **kwargs):
         """Wrap callbacks with this if they are used on asynchronous requests.
@@ -308,12 +318,12 @@ class WebSocket(object):
         if args or kwargs:
             callback = functools.partial(callback, *args, **kwargs)
 
-        def wrapper(*args, **kwargs):
+        async def wrapper(*args, **kwargs):
             try:
-                return callback(*args, **kwargs)
+                await callback(*args, **kwargs)
             except Exception:
                 logging.error('Uncaught exception', exc_info=True)
-                self._abort()
+                await self._abort()
 
         return wrapper
 
@@ -321,35 +331,34 @@ class WebSocket(object):
 def main(url, message='hello, world'):
     class HelloSocket(WebSocket):
 
-        def on_open(self):
-            self.ping()
+        async def on_open(self):
+            await self.ping()
             print('>> ' + message)
-            self.write_message(message)
+            await self.write_message(message)
 
-        def on_message(self, data):
+        async def on_message(self, data):
             print('on_message: ' + data)
             msg = eval(input('>> '))
             if msg == 'ping':
-                self.ping()
+                await self.ping()
             elif msg == 'die':
-                self.close()
+                await self.close()
             else:
-                self.write_message(msg)
+                await self.write_message(msg)
 
-        def on_close(self):
+        async def on_close(self):
             print('on_close')
 
-        def on_pong(self):
+        async def on_pong(self):
             print('on_pong')
 
     ws = HelloSocket(url)
     try:
-        ioloop.IOLoop.instance().start()
+        ioloop.IOLoop.current().run_sync(ws.start)
     except KeyboardInterrupt:
         pass
     finally:
-        ws.close()
-
+        ioloop.IOLoop.current().run_sync(ws.close)
 
 if __name__ == '__main__':
     main(*sys.argv[1:])
